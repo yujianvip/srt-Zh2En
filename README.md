@@ -4,7 +4,7 @@ Windows 11 桌面工具。导入 SRT 字幕，用本机 Ollama 或 DeepL API 翻
 
 ## 快速使用
 
-从 [GitHub Releases](https://github.com/yujianvip/srt-Zh2En/releases) 下载 `字幕翻译器-v1.0-发布包.zip` 并解压。首次使用英文配音前，安装 Python 3.11，双击包内的 `setup_voxcpm.bat` 创建语音环境。模型首次生成时下载。也可下载单独的 EXE，但需自行把同版本安装脚本和依赖清单放在 EXE 同级目录。
+从 [GitHub Releases](https://github.com/yujianvip/srt-Zh2En/releases) 下载 `srt-Zh2En-v1.0-package.zip` 并解压。首次使用英文配音前，安装 Python 3.11，双击包内的 `setup_voxcpm.bat` 创建语音环境。模型首次生成时下载。也可下载单独的 EXE，但需自行把同版本安装脚本和依赖清单放在 EXE 同级目录。
 
 1. 双击项目根目录的 `字幕翻译器-v1.0.exe`，导入或拖入 SRT。
 2. 选择翻译方式：使用 Ollama 时先启动服务、刷新模型列表并选择模型；使用 DeepL 时填写 API Key。
@@ -58,8 +58,8 @@ Hello everyone, this is Meet AI.
 
 ## GitHub 发布
 
-源码按 [MIT 许可证](LICENSE)发布。Git 仓库只提交源码、脚本和文档；EXE、模型、虚拟环境和个人字幕音频由 `.gitignore` 排除。正式发布时使用 `v1.0.0` 标签，并将 `字幕翻译器-v1.0.exe`、`字幕翻译器-v1.0-发布包.zip` 及其 SHA-256 校验值作为 Release 附件。
+源码按 [MIT 许可证](LICENSE)发布。Git 仓库只提交源码、脚本和文档；EXE、模型、虚拟环境和个人字幕音频由 `.gitignore` 排除。正式发布时使用 `v1.0.0` 标签，并将 `srt-Zh2En-v1.0.exe`、`srt-Zh2En-v1.0-package.zip` 及其 SHA-256 校验值作为 Release 附件。下载包内的 EXE 仍叫 `字幕翻译器-v1.0.exe`。
 
 ## 检查更新
 
-主界面顶部的“检查更新”会查询 GitHub 仓库 `yujianvip/srt-Zh2En` 的最新正式 Release。发布新版本时，Release 标签使用 `v主版本.次版本.修订号`（例如 `v1.0.1`），并上传名为 `字幕翻译器-v1.0.exe` 的构建文件。用户确认更新后，程序下载并校验文件，关闭后自动替换并重启。
+主界面顶部的“检查更新”会查询 GitHub 仓库 `yujianvip/srt-Zh2En` 的最新正式 Release。发布新版本时，Release 标签使用 `v主版本.次版本.修订号`（例如 `v1.0.1`），并上传名为 `srt-Zh2En-v1.0.exe` 的构建文件。用户确认更新后，程序下载并校验文件，关闭后自动替换并重启。
