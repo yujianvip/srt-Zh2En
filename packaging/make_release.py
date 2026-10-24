@@ -2,7 +2,6 @@
 
 import argparse
 import hashlib
-import shutil
 import zipfile
 from pathlib import Path
 
@@ -17,7 +16,7 @@ def sha256(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="1.0.1")
+    parser.add_argument("--version", default="1.0.2")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     exe = root / "字幕翻译器-v1.0.exe"
@@ -27,7 +26,6 @@ def main():
     assets = root / "release-assets"
     assets.mkdir(exist_ok=True)
     zip_path = assets / f"srt-Zh2En-v{args.version}-package.zip"
-    update_exe = assets / "srt-Zh2En-v1.0.exe"
     files = [
         (exe, exe.name),
         *[(root / name, name) for name in (
@@ -41,7 +39,6 @@ def main():
         if not path.is_file():
             raise FileNotFoundError(path)
 
-    shutil.copy2(exe, update_exe)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED,
                          compresslevel=6) as archive:
         for path, name in files:
@@ -53,12 +50,10 @@ def main():
 
     checksums = assets / "SHA256SUMS.txt"
     checksums.write_text(
-        f"{sha256(zip_path)}  {zip_path.name}\n"
-        f"{sha256(update_exe)}  {update_exe.name}\n",
+        f"{sha256(zip_path)}  {zip_path.name}\n",
         encoding="ascii",
     )
     print(f"ZIP: {zip_path} ({zip_path.stat().st_size / 1024**2:.1f} MiB)")
-    print(f"更新 EXE: {update_exe} ({update_exe.stat().st_size / 1024**2:.1f} MiB)")
     print(f"SHA256: {checksums}")
 
 

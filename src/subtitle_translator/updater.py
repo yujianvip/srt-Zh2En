@@ -1,4 +1,4 @@
-"""GitHub Releases 检查与 Windows 单文件 EXE 原子更新。"""
+"""从 GitHub Release 的 ZIP 更新 Windows 程序。"""
 
 import hashlib
 import json
@@ -10,12 +10,13 @@ import tempfile
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPOSITORY = "yujianvip/srt-Zh2En"
-EXE_NAME = "srt-Zh2En-v1.0.exe"
+EXE_NAME = "字幕翻译器-v1.0.exe"
 MAX_UPDATE_SIZE = 400 * 1024 * 1024
 
 
@@ -53,9 +54,10 @@ def check_latest_release(repository=GITHUB_REPOSITORY, current_version=APP_VERSI
     remote_version = _version_tuple(tag)
     current = _version_tuple(current_version)
     assets = release.get("assets", [])
-    asset = next((item for item in assets if item.get("name") == EXE_NAME), None)
+    package_name = f"srt-Zh2En-{tag}-package.zip"
+    asset = next((item for item in assets if item.get("name") == package_name), None)
     if remote_version > current and asset is None:
-        raise RuntimeError(f"Release {tag} 缺少更新文件 {EXE_NAME}。")
+        raise RuntimeError(f"Release {tag} 缺少更新压缩包 {package_name}。")
     return {
         "tag": tag,
         "version": remote_version,
@@ -74,12 +76,13 @@ def download_release(release, progress=None):
     expected_size = int(asset.get("size", 0))
     if expected_size <= 0 or expected_size > MAX_UPDATE_SIZE:
         raise RuntimeError("更新文件大小异常，已停止下载。")
-    target = Path(tempfile.gettempdir()) / f"subtitle-studio-{uuid.uuid4().hex}.exe"
+    package = Path(tempfile.gettempdir()) / f"subtitle-studio-{uuid.uuid4().hex}.zip"
+    target = package.with_suffix(".exe")
     digest = hashlib.sha256()
     total = 0
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "SubtitleStudio-Updater"})
-        with urllib.request.urlopen(request, timeout=30) as response, target.open("wb") as output:
+        with urllib.request.urlopen(request, timeout=30) as response, package.open("wb") as output:
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
@@ -96,10 +99,26 @@ def download_release(release, progress=None):
         expected_digest = asset.get("digest")
         if expected_digest and expected_digest.lower() != f"sha256:{digest.hexdigest()}":
             raise RuntimeError("更新文件 SHA-256 校验失败。")
+        with zipfile.ZipFile(package) as archive:
+            try:
+                entry = archive.getinfo(EXE_NAME)
+            except KeyError as exc:
+                raise RuntimeError(f"更新包缺少 {EXE_NAME}。") from exc
+            if entry.file_size < 1024 * 1024 or entry.file_size > MAX_UPDATE_SIZE:
+                raise RuntimeError("更新包内的 EXE 大小异常。")
+            with archive.open(entry) as source, target.open("wb") as output:
+                while chunk := source.read(1024 * 1024):
+                    output.write(chunk)
+        with target.open("rb") as executable:
+            valid_header = executable.read(2) == b"MZ"
+        if target.stat().st_size != entry.file_size or not valid_header:
+            raise RuntimeError("更新包内的 EXE 无效。")
         return target
     except Exception:
         target.unlink(missing_ok=True)
         raise
+    finally:
+        package.unlink(missing_ok=True)
 
 
 def launch_windows_installer(staged_exe, target_exe):
@@ -133,7 +152,7 @@ def launch_windows_installer(staged_exe, target_exe):
         "  if (Test-Path -LiteralPath $backup) { Move-Item -LiteralPath $backup -Destination $target -Force; Start-Process -FilePath $target }\n"
         "  throw\n"
         "} finally { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue }\n",
-        encoding="utf-8",
+        encoding="utf-8-sig",
     )
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:

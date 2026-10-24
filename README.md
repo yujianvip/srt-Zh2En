@@ -4,7 +4,7 @@ Windows 11 桌面工具。导入 SRT 字幕，用本机 Ollama 或 DeepL API 翻
 
 ## 快速使用
 
-从 [GitHub Releases](https://github.com/yujianvip/srt-Zh2En/releases) 下载 `srt-Zh2En-v1.0.1-package.zip` 并解压。首次使用先安装 **Python 3.11**，再双击包内的 `setup_voxcpm.bat`；脚本会在软件同目录创建独立的 `.venv-tts` 配音环境。安装完成后打开 `字幕翻译器-v1.0.exe`，点击“检测配音模型”，按提示下载 VoxCPM2 模型。之后使用软件无需再运行 BAT。
+从 [GitHub Releases](https://github.com/yujianvip/srt-Zh2En/releases) 下载最新的 `srt-Zh2En-v版本号-package.zip` 并解压。首次使用先安装 **Python 3.11**，再双击包内的 `setup_voxcpm.bat`；脚本会在软件同目录创建独立的 `.venv-tts` 配音环境。安装完成后打开 `字幕翻译器-v1.0.exe`，点击“检测配音模型”，按提示下载 VoxCPM2 模型。之后使用软件无需再运行 BAT。
 
 1. 首次使用先运行 `setup_voxcpm.bat`；看到“配音环境安装完成”后，双击 `字幕翻译器-v1.0.exe`，导入或拖入 SRT。
 2. 选择翻译方式：使用 Ollama 时先启动服务、刷新模型列表并选择模型；使用 DeepL 时填写 API Key。
@@ -46,20 +46,20 @@ Hello everyone, this is Meet AI.
 
 - **Ollama 翻译**：需在本机安装并启动 Ollama 服务。默认地址为 `http://localhost:11434`，默认模型名为 `qwen3.5:9b`；可在界面中更换。程序通过 Ollama API 调用模型。当前版本不会自动启动 Ollama，也没有内置推理引擎；仅有硬盘上的模型文件，无法直接完成翻译。
 - **DeepL 翻译**：需填写可用的 DeepL API Key。Key 只用于当前运行，不写入设置文件。
-- **英文配音**：需 Python 3.11 和支持 CUDA 的 NVIDIA 显卡。`setup_voxcpm.bat` 在本机安装 `.venv-tts`，不修改系统 Python 的依赖。软件通过“检测配音模型”按钮检查安装目录下的 `.model-cache`；缺少模型时可在界面中下载。配音环境和模型都需要预留数 GB 磁盘空间。发布 ZIP 与 EXE 均不包含配音环境或模型。
+- **英文配音**：需 Python 3.11 和支持 CUDA 的 NVIDIA 显卡。`setup_voxcpm.bat` 在本机安装 `.venv-tts`，不修改系统 Python 的依赖。软件通过“检测配音模型”按钮检查安装目录下的 `.model-cache`；缺少模型时可在界面中下载。配音环境和模型都需要预留数 GB 磁盘空间。发布 ZIP 内的 EXE 不包含配音环境或模型。
 
 普通设置保存在 `%LOCALAPPDATA%\字幕翻译器\settings.json`。机器译文仍需核对产品名、界面文字和专业术语。
 
 ## 从源码构建
 
-在 Windows 11、Python 3.11 环境下双击 `build.bat` 构建主程序；之后运行 `.venv\Scripts\python.exe packaging\make_release.py` 生成小型发布 ZIP、更新用 EXE 和校验文件。如需直接从源码启动，先在 `.venv` 中安装 `requirements.txt`，再运行 `run_app.py`。源码使用者也需要运行 `setup_voxcpm.bat` 安装配音环境。
+在 Windows 11、Python 3.11 环境下双击 `build.bat` 构建主程序；之后运行 `.venv\Scripts\python.exe packaging\make_release.py` 生成小型发布 ZIP 和校验文件。如需直接从源码启动，先在 `.venv` 中安装 `requirements.txt`，再运行 `run_app.py`。源码使用者也需要运行 `setup_voxcpm.bat` 安装配音环境。
 
 项目使用的第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## GitHub 发布
 
-源码按 [MIT 许可证](LICENSE)发布。Git 仓库只提交源码、脚本和文档；EXE、模型、虚拟环境和个人字幕音频由 `.gitignore` 排除。GitHub Release 提供小型 ZIP 供新用户安装，以及单独 EXE 供已有配音环境的用户更新。程序内的自动更新只更新主 EXE；环境依赖变化时应重新运行 BAT。
+源码按 [MIT 许可证](LICENSE)发布。Git 仓库只提交源码、脚本和文档；EXE、模型、虚拟环境和个人字幕音频由 `.gitignore` 排除。GitHub Release **只提供小型 ZIP**，不单独上传 EXE。程序内的自动更新从 ZIP 提取新版 EXE，保留本机已安装的配音环境和模型；环境依赖变化时应重新运行 BAT。
 
 ## 检查更新
 
-主界面顶部的“检查更新”会查询 GitHub 仓库 `yujianvip/srt-Zh2En` 的最新正式 Release。发布新版本时，Release 标签使用 `v主版本.次版本.修订号`（例如 `v1.0.1`），并上传名为 `srt-Zh2En-v1.0.exe` 的构建文件。用户确认更新后，程序下载并校验文件，关闭后自动替换并重启。
+主界面顶部的“检查更新”会查询 GitHub 仓库 `yujianvip/srt-Zh2En` 的最新正式 Release。发布新版本时，Release 标签使用 `v主版本.次版本.修订号`（例如 `v1.0.2`），并上传相同版本的 `srt-Zh2En-v版本号-package.zip`。用户确认更新后，程序下载并校验 ZIP，提取其中的 EXE，关闭后自动替换并重启。v1.0.1 及更早版本仍按旧规则寻找独立 EXE，切换到仅 ZIP 发布后需要手动下载一次新 ZIP。
