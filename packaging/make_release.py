@@ -16,7 +16,7 @@ def sha256(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="1.0.2")
+    parser.add_argument("--version", default="1.0.3")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     exe = root / "字幕翻译器-v1.0.exe"

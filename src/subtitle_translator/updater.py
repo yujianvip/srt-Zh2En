@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPOSITORY = "yujianvip/srt-Zh2En"
 EXE_NAME = "字幕翻译器-v1.0.exe"
 MAX_UPDATE_SIZE = 400 * 1024 * 1024

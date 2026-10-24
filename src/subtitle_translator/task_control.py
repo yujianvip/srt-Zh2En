@@ -18,7 +18,11 @@ class TaskControl:
         self.cancelled.set()
         with self._lock:
             if self._process is not None and self._process.poll() is None:
-                self._process.kill()
+                try:
+                    self._process.kill()
+                except (ProcessLookupError, OSError):
+                    # The child may exit between poll() and kill().
+                    pass
 
     def check(self):
         if self.cancelled.is_set():

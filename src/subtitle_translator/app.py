@@ -119,6 +119,7 @@ class SubtitleTranslator:
         self.events = queue.Queue()
         self.busy = False
         self._close_after_stop = False
+        self._pending_update_path = None
         self._task_control = TaskControl()
         self.source_label = tk.StringVar(value="尚未载入 SRT")
         self.status = tk.StringVar(value="载入剪映导出的中文或中英双语 SRT；英文单语也可用于逐句查看。")
@@ -139,6 +140,7 @@ class SubtitleTranslator:
         self.model_display = tk.StringVar()
         self.model_display_to_name = {}
         self.available_models = []
+        self._model_refresh_serial = 0
         self.output_dir = tk.StringVar(value=self.settings.get("output_dir", str(project_dir / "输出")))
         self.github_repo = tk.StringVar(value=self.settings.get("github_repo", GITHUB_REPOSITORY))
         self.progress_value = tk.DoubleVar(value=0)
@@ -159,6 +161,7 @@ class SubtitleTranslator:
         self.auto_voice_started = 0.0
         self.auto_voice_countdown = tk.StringVar(value="")
         self._build()
+        self.ollama_address.trace_add("write", self._ollama_address_changed)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(150, self._poll)
         self.root.after(200, self._update_audio_player)
@@ -204,6 +207,11 @@ class SubtitleTranslator:
         self._cancel_auto_voice()
         self._stop_sentence_preview()
         self.audio_player.close()
+        if self._pending_update_path is not None:
+            try:
+                Path(self._pending_update_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
             self._save_settings()
         except OSError:
@@ -306,6 +314,7 @@ class SubtitleTranslator:
                         cue_types.add("english")
                 if len(cue_types) > 1:
                     raise ValueError("文件混合了单语和双语条目，无法可靠识别。请统一字幕格式后再载入。")
+            self._clear_loaded_audio()
             self.items = items
             self.results = {"DeepL": None, "Ollama": None}
             self.active = self.provider.get()
@@ -362,8 +371,16 @@ class SubtitleTranslator:
         if self.busy:
             return
         address = self.ollama_address.get().strip()
+        self._model_refresh_serial += 1
+        serial = self._model_refresh_serial
         self.status.set("正在读取 Ollama 模型列表……")
-        threading.Thread(target=self._models_worker, args=(address, silent), daemon=True).start()
+        threading.Thread(target=self._models_worker, args=(address, silent, serial), daemon=True).start()
+
+    def _ollama_address_changed(self, *_args):
+        self._model_refresh_serial += 1
+        self.available_models = []
+        self._refresh_model_options()
+        self.status.set("Ollama 地址已更改，请刷新模型列表。")
 
     def prompt_start_ollama(self, error):
         """Offer to launch the installed Ollama app when its service is unavailable."""
@@ -418,12 +435,13 @@ class SubtitleTranslator:
             return
         raise OSError("未找到 Ollama 桌面程序或命令行程序。请先安装 Ollama，或确认安装路径可用。")
 
-    def _models_worker(self, address, silent):
+    def _models_worker(self, address, silent, serial):
         event_type = "MODELS_AUTO" if silent else "MODELS"
         try:
-            self.events.put((event_type, list_models(address), None))
+            self.events.put((event_type, {"address": address, "serial": serial,
+                                          "models": list_models(address)}, None))
         except Exception as exc:
-            self.events.put((event_type, None, str(exc)))
+            self.events.put((event_type, {"address": address, "serial": serial}, str(exc)))
 
     def set_default_model(self):
         if self.model_name.get().strip() not in self.available_models:
@@ -486,6 +504,10 @@ class SubtitleTranslator:
         if self.busy:
             messagebox.showinfo("正在处理", "请等当前任务完成后再检查更新。")
             return
+        if self._pending_update_path is not None:
+            if messagebox.askyesno("更新已下载", "更新文件已下载。现在安装并重启程序吗？"):
+                self._install_downloaded_update(self._pending_update_path)
+            return
         repository = self.github_repo.get().strip()
         self.status.set("正在检查 GitHub 更新……")
         self.update_button.configure(state="disabled")
@@ -511,6 +533,20 @@ class SubtitleTranslator:
     def _begin_update_download(self, release):
         self.status.set(f"正在下载版本 {release['tag']}……")
         threading.Thread(target=self._download_update_worker, args=(release,), daemon=True).start()
+
+    def _install_downloaded_update(self, path):
+        try:
+            launch_windows_installer(path, sys.executable)
+        except Exception as exc:
+            self.update_button.configure(state="normal")
+            self.status.set("更新安装启动失败。")
+            messagebox.showerror("更新失败", str(exc))
+            return False
+        self._pending_update_path = None
+        self.status.set("更新文件已校验，正在重启并安装……")
+        self.audio_player.close()
+        self.root.destroy()
+        return True
 
     def show_completion_dialog(self, folder, wav_path, positions):
         dialog = tk.Toplevel(self.root)
@@ -677,17 +713,41 @@ class SubtitleTranslator:
             companion = Path(path).with_name(Path(path).stem.replace("英文配音", "中英双语字幕") + ".srt")
             try:
                 blocks = read_srt(companion) if companion.is_file() else []
-                timings = blocks if len(blocks) == len(self.items) else self.items
+                current_english = self.results.get(self.active)
+                matched = (
+                    current_english is not None
+                    and len(current_english) == len(self.items) == len(blocks)
+                    and all(
+                        block["text"] == item["text"] + "\n" + english
+                        for block, item, english in zip(blocks, self.items, current_english)
+                    )
+                )
                 positions = [{
-                    "start_ms": self._parse_preview_time(item["time"].split("-->")[0]),
-                    "end_ms": self._parse_preview_time(item["time"].split("-->")[1]),
-                } for item in timings]
+                    "start_ms": self._parse_preview_time(block["time"].split("-->")[0]),
+                    "end_ms": self._parse_preview_time(block["time"].split("-->")[1]),
+                } for block in blocks] if matched else []
             except (OSError, ValueError, KeyError):
                 positions = []
         self._preview_positions = positions
         self._preview_items = self.items
         self._preview_last_row = None
         self._preview_last_position = None
+        if hasattr(self, "_ui_refresh_edit_state"):
+            self._ui_refresh_edit_state()
+
+    def _clear_loaded_audio(self):
+        self._stop_sentence_preview()
+        self.audio_player.close()
+        self.audio_name.set("生成配音后可在这里试听")
+        self.audio_play_label.set("播放")
+        self.audio_duration_ms = 0
+        self.audio_position.set(0)
+        self.audio_time_label.set("00:00 / 00:00")
+        self.audio_slider.configure(to=1)
+        self._preview_positions = []
+        self._preview_items = None
+        self._preview_follow_enabled = True
+        self._clear_preview_highlight()
         if hasattr(self, "_ui_refresh_edit_state"):
             self._ui_refresh_edit_state()
 
@@ -737,6 +797,10 @@ class SubtitleTranslator:
         if path:
             try:
                 self._load_audio(path)
+                if not self._preview_positions:
+                    self.status.set("已打开 WAV；未找到与当前译稿匹配的配套字幕，逐句试听不可用。")
+                else:
+                    self.status.set("已打开配音和匹配的双语字幕，可逐句试听。")
             except Exception as exc:
                 messagebox.showerror("无法打开音频", str(exc))
 
@@ -852,6 +916,7 @@ class SubtitleTranslator:
             messagebox.showinfo("需要本地模型", "先连接 Ollama 并刷新模型列表。")
             return
         self._cancel_auto_voice()
+        self._clear_loaded_audio()
         self.status.set(f"正在生成 {provider} 版本，请稍候……")
         self._set_progress(0)
         self._set_busy(True)
@@ -1000,16 +1065,12 @@ class SubtitleTranslator:
                     self.status.set(f"正在下载更新：{percent:.0f}%")
                     continue
                 if provider == "UPDATE_DOWNLOADED":
-                    try:
-                        launch_windows_installer(values["path"], sys.executable)
-                    except Exception as exc:
-                        self.update_button.configure(state="normal")
-                        self.status.set("更新安装启动失败。")
-                        messagebox.showerror("更新失败", str(exc))
-                    else:
-                        self.status.set("更新文件已校验，正在重启并安装……")
-                        self.audio_player.close()
-                        self.root.destroy()
+                    if self.busy:
+                        self._pending_update_path = values["path"]
+                        self.update_button.configure(state="normal", text="安装已下载更新")
+                        self.status.set("更新已下载；当前任务完成后，点击“安装已下载更新”继续。")
+                        continue
+                    if self._install_downloaded_update(values["path"]):
                         return
                     continue
                 if provider == "UPDATE_ERROR":
@@ -1018,6 +1079,9 @@ class SubtitleTranslator:
                     messagebox.showerror("更新失败", error)
                     continue
                 if provider in ("MODELS", "MODELS_AUTO"):
+                    if (values["serial"] != self._model_refresh_serial or
+                            values["address"] != self.ollama_address.get().strip()):
+                        continue
                     if error:
                         if provider == "MODELS":
                             self.status.set("读取 Ollama 模型失败。")
@@ -1026,12 +1090,13 @@ class SubtitleTranslator:
                             else:
                                 messagebox.showerror("读取 Ollama 模型失败", error)
                     else:
-                        self.available_models = values
-                        if values and self.model_name.get() not in values:
-                            preferred = next((name for name in values if name == "qwen3.5:9b"), values[0])
+                        models = values["models"]
+                        self.available_models = models
+                        if models and self.model_name.get() not in models:
+                            preferred = next((name for name in models if name == "qwen3.5:9b"), models[0])
                             self.model_name.set(preferred)
                         self._refresh_model_options()
-                        self.status.set(f"已从 Ollama 读取 {len(values)} 个模型。")
+                        self.status.set(f"已从 Ollama 读取 {len(models)} 个模型。")
                     continue
                 if provider == "TRANSLATE_PROGRESS":
                     self._set_progress(100 * values["done"] / values["total"])
@@ -1125,6 +1190,8 @@ class SubtitleTranslator:
             self.provider.set(self.active)
             self._ui_refresh_provider()
             return
+        if self.active != self.provider.get():
+            self._clear_loaded_audio()
         self.active = self.provider.get()
         self.show_rows(self.results[self.active])
         if self.auto_voice_pending and self.results[self.active] is None:
@@ -1357,12 +1424,7 @@ class SubtitleTranslator:
             messagebox.showerror("缺少语音模块", f"找不到语音工作程序：{worker}")
             return
         # Windows MCI keeps the preview WAV open and blocks replacing it.
-        self.audio_player.close()
-        self.audio_name.set("生成配音后可在这里试听")
-        self.audio_play_label.set("播放")
-        self.audio_duration_ms = 0
-        self.audio_position.set(0)
-        self.audio_time_label.set("00:00 / 00:00")
+        self._clear_loaded_audio()
         self._cancel_auto_voice()
         self.status.set("正在启动 VoxCPM2；首次运行需要下载模型权重……")
         self._set_progress(0)

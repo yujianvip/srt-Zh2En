@@ -78,6 +78,26 @@ def _write_reference_wav(path, audio, sample_rate):
         wav_file.writeframes(samples.tobytes())
 
 
+MAX_SPEEDUP = 1.25
+
+
+def fit_audio_to_window(audio, target_samples, group_index):
+    """Keep speech inside its source cue window without changing voice pitch."""
+    if target_samples <= 0:
+        raise ValueError(f"第 {group_index} 组字幕时间窗无效。")
+    if len(audio) <= target_samples:
+        return audio
+    speedup = len(audio) / target_samples
+    if speedup > MAX_SPEEDUP:
+        raise ValueError(
+            f"第 {group_index} 组英文配音比原字幕时间窗长 {speedup:.2f} 倍；"
+            "为避免画面与配音错位，请缩短这组英文后重试。"
+        )
+    import librosa
+    stretched = librosa.effects.time_stretch(audio, rate=speedup)
+    return stretched[:target_samples]
+
+
 def _default_voice_reference(model, torch, np, model_dir, sample_rate, task_temp_dir=None):
     """Generate and cache one deterministic seed voice for no-reference projects."""
     reference_path = model_dir / "default_english_voice.wav"
@@ -139,7 +159,11 @@ def generate(manifest_path):
                 if not text:
                     raise ValueError(f"第 {group_index} 组英文为空，请先修改字幕。")
                 original_start = ms_from_timecode(group[0]["time"].split("-->")[0].strip())
-                start_sample = max(cursor_samples, round(original_start * sample_rate / 1000))
+                original_end = ms_from_timecode(group[-1]["time"].split("-->")[1].strip())
+                start_sample = round(original_start * sample_rate / 1000)
+                end_sample = round(original_end * sample_rate / 1000)
+                if start_sample < cursor_samples:
+                    raise ValueError(f"第 {group_index} 组字幕时间与上一组重叠，无法保持原视频节奏。")
                 if start_sample > cursor_samples:
                     wav_file.writeframes(b"\x00\x00" * (start_sample - cursor_samples))
                 options = {"text": text, "cfg_value": 2.0, "inference_timesteps": 10}
@@ -148,22 +172,21 @@ def generate(manifest_path):
                 audio = np.asarray(model.generate(**options), dtype=np.float32).reshape(-1)
                 if audio.size == 0:
                     raise ValueError(f"第 {group_index} 组没有生成音频。")
+                audio = fit_audio_to_window(audio, end_sample - start_sample, group_index)
                 samples = (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2")
                 wav_file.writeframes(samples.tobytes())
-                weights = [max(1, len(x["english"].split())) for x in group]
-                weight_total = sum(weights)
-                elapsed = 0
-                for item, weight in zip(group, weights):
-                    cue_start = start_sample + round(len(samples) * elapsed / weight_total)
-                    elapsed += weight
-                    cue_end = start_sample + round(len(samples) * elapsed / weight_total)
-                    original_cue_start = ms_from_timecode(item["time"].split("-->")[0].strip())
+                for item in group:
+                    cue_start = ms_from_timecode(item["time"].split("-->")[0].strip())
+                    cue_end = ms_from_timecode(item["time"].split("-->")[1].strip())
                     positions.append({
-                        "start_ms": round(cue_start * 1000 / sample_rate),
-                        "end_ms": round(cue_end * 1000 / sample_rate),
-                        "shift_ms": round(cue_start * 1000 / sample_rate) - original_cue_start,
+                        "start_ms": cue_start,
+                        "end_ms": cue_end,
+                        "shift_ms": 0,
                     })
-                cursor_samples = start_sample + len(samples)
+                padding = end_sample - start_sample - len(samples)
+                if padding > 0:
+                    wav_file.writeframes(b"\x00\x00" * padding)
+                cursor_samples = end_sample
                 progress(group_index, len(groups))
         os.replace(temp, output)
         Path(manifest["timing_path"]).write_text(

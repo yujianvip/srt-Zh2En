@@ -516,9 +516,11 @@ def build_ui(app):
 
     def refresh_edit_state():
         enabled = editing["item"] is not None and not app.busy
+        has_aligned_audio = (app.audio_player.path is not None and
+                             len(getattr(app, "_preview_positions", [])) == len(app.items))
         for button in app.sentence_preview_buttons:
             if button is not None:
-                button.configure(state="normal" if enabled and app.audio_player.path is not None else "disabled")
+                button.configure(state="normal" if enabled and has_aligned_audio else "disabled")
         for field in fields:
             field.configure(state="normal" if enabled else "disabled")
         save_button.configure(state="normal" if enabled and dirty() else "disabled")
@@ -527,13 +529,25 @@ def build_ui(app):
         if app.busy or editing["item"] is None:
             return False
         zh, original, translated = contents()
+        changed = (zh, original, translated) != editing["snapshot"]
         item = editing["item"]
         index = editing["index"]
         provider = editing["provider"]
+        source_changed = zh != editing["snapshot"][0]
+        translation_changed = translated != editing["snapshot"][2]
+        if source_changed:
+            for other_provider, other_values in app.results.items():
+                if other_provider != provider and other_values is not None:
+                    other_values[index] = ""
+            if not translation_changed:
+                translated = ""
+                editing["loading"] = True
+                fields[2].delete("1.0", "end")
+                editing["loading"] = False
         item["text"] = zh
         item["original_english"] = original
         values = app.results[provider]
-        if values is not None or translated != editing["snapshot"][2]:
+        if values is not None or translation_changed:
             if values is None:
                 values = [""] * len(app.items)
                 app.results[provider] = values
@@ -544,8 +558,13 @@ def build_ui(app):
             if app.active == provider:
                 app.table.set(str(index), "english", translated.replace("\n", " "))
         editing["snapshot"] = (zh, original, translated)
+        if changed and app.audio_player.path is not None:
+            app._clear_loaded_audio()
         edit_status.set("已保存到当前任务")
-        app.status.set(f"第 {index+1} 条修改已保存到当前任务；后续翻译和配音使用保存后的内容。")
+        if source_changed:
+            app.status.set(f"第 {index+1} 条中文已修改；未同步修改的旧译文已清空，请重新翻译或补写英文。")
+        else:
+            app.status.set(f"第 {index+1} 条修改已保存到当前任务；后续翻译和配音使用保存后的内容。")
         refresh_edit_state()
         return True
 
@@ -557,7 +576,14 @@ def build_ui(app):
             return False
         if answer:
             return save_edits()
-        editing["snapshot"] = contents()
+        editing["loading"] = True
+        for field, value in zip(fields, editing["snapshot"]):
+            field.delete("1.0", "end")
+            field.insert("1.0", value)
+            field.edit_modified(False)
+        editing["loading"] = False
+        edit_status.set("已放弃修改")
+        refresh_edit_state()
         return True
 
     save_button = _subtle_button(detail_head, "保存修改", save_edits)
