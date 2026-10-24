@@ -1,10 +1,12 @@
-"""由桌面程序调用的 VoxCPM2 工作进程。依赖单独的 .venv-tts。"""
+"""由桌面程序调用的 VoxCPM2 工作进程。"""
 
 import json
 import os
 import sys
 import wave
 from pathlib import Path
+from modelscope.hub import ProgressCallback
+from voice_model import MODEL_REPO, missing_model_files, model_directory
 
 
 def ms_from_timecode(value):
@@ -38,6 +40,35 @@ def progress(done, total):
     print(json.dumps({"progress": done, "total": total}), flush=True)
 
 
+class _ModelDownloadProgress(ProgressCallback):
+    """Forward ModelScope's per-file download progress to the desktop UI."""
+
+    def __init__(self, filename, file_size):
+        super().__init__(filename, file_size)
+        self.filename = Path(filename).name
+        self.total = max(0, int(file_size or 0))
+        self.done = 0
+        self._emit()
+
+    def update(self, size):
+        self.done += max(0, int(size or 0))
+        self._emit()
+
+    def end(self):
+        if self.total:
+            self.done = self.total
+        self._emit()
+
+    def _emit(self):
+        print(json.dumps({
+            "model_download": {
+                "filename": self.filename,
+                "done": self.done,
+                "total": self.total,
+            }
+        }), flush=True)
+
+
 def _write_reference_wav(path, audio, sample_rate):
     samples = (audio.clip(-1.0, 1.0) * 32767).astype("<i2")
     with wave.open(str(path), "wb") as wav_file:
@@ -47,7 +78,7 @@ def _write_reference_wav(path, audio, sample_rate):
         wav_file.writeframes(samples.tobytes())
 
 
-def _default_voice_reference(model, torch, np, model_dir, sample_rate):
+def _default_voice_reference(model, torch, np, model_dir, sample_rate, task_temp_dir=None):
     """Generate and cache one deterministic seed voice for no-reference projects."""
     reference_path = model_dir / "default_english_voice.wav"
     if reference_path.is_file() and reference_path.stat().st_size > 1024:
@@ -67,7 +98,7 @@ def _default_voice_reference(model, torch, np, model_dir, sample_rate):
     ).reshape(-1)
     if audio.size == 0:
         raise RuntimeError("生成默认英文音色失败，模型没有返回音频。")
-    temp = reference_path.with_suffix(".partial.wav")
+    temp = (Path(task_temp_dir) / "default_english_voice.partial.wav") if task_temp_dir else reference_path.with_suffix(".partial.wav")
     try:
         _write_reference_wav(temp, audio, sample_rate)
         os.replace(temp, reference_path)
@@ -83,7 +114,7 @@ def generate(manifest_path):
     from voxcpm import VoxCPM
 
     if not torch.cuda.is_available():
-        raise RuntimeError("未检测到 CUDA 版 PyTorch。请重新运行 setup_voxcpm.bat 安装 GPU 依赖。")
+        raise RuntimeError("未检测到 CUDA 版 PyTorch。请检查显卡驱动或重新下载完整配音组件。")
 
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     items = manifest["items"]
@@ -91,14 +122,11 @@ def generate(manifest_path):
     output = Path(manifest["wav_path"])
     temp = output.with_suffix(".partial.wav")
     reference = manifest.get("reference_wav") or None
-    model_dir = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))) / "VoxCPM2"
-    if not (model_dir / "model.safetensors").is_file() or not (model_dir / "audiovae.pth").is_file():
-        from modelscope import snapshot_download
-        snapshot_download("OpenBMB/VoxCPM2", local_dir=str(model_dir))
+    model_dir = download_model()
     model = VoxCPM.from_pretrained(str(model_dir), device="cuda", load_denoiser=False, optimize=False)
     sample_rate = int(model.tts_model.sample_rate)
     if not reference:
-        reference = str(_default_voice_reference(model, torch, np, model_dir, sample_rate))
+        reference = str(_default_voice_reference(model, torch, np, model_dir, sample_rate, manifest.get("task_temp_dir")))
     positions = []
     cursor_samples = 0
     try:
@@ -147,9 +175,26 @@ def generate(manifest_path):
             temp.unlink()
 
 
+def download_model():
+    cache_root = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    model_dir = model_directory(cache_root)
+    if missing_model_files(cache_root):
+        from modelscope import snapshot_download
+        snapshot_download(MODEL_REPO, local_dir=str(model_dir),
+                          progress_callbacks=[_ModelDownloadProgress])
+    missing = missing_model_files(cache_root)
+    if missing:
+        raise RuntimeError("配音模型下载不完整：" + "、".join(missing))
+    return model_dir
+
+
 if __name__ == "__main__":
     try:
-        generate(sys.argv[1])
+        if len(sys.argv) == 2 and sys.argv[1] == "--download-model":
+            download_model()
+            print(json.dumps({"model_ready": True}), flush=True)
+        else:
+            generate(sys.argv[1])
     except Exception as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), flush=True)
         raise

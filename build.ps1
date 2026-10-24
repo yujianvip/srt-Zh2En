@@ -16,7 +16,8 @@ if ($LASTEXITCODE -ne 0) { throw '安装构建依赖失败。' }
 & $python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name '字幕翻译器-v1.0' --distpath . --workpath build --specpath build `
     --paths $sourcePath --collect-all tkinterdnd2 `
-    --add-data "$workerPath;." run_app.py
+    --add-data "$workerPath;." `
+    --add-data "$(Join-Path $sourcePath 'subtitle_translator\voice_model.py');." run_app.py
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 打包失败。' }
 
 $exe = Get-Item -LiteralPath '.\字幕翻译器-v1.0.exe'

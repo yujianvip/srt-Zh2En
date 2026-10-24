@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPOSITORY = "yujianvip/srt-Zh2En"
 EXE_NAME = "srt-Zh2En-v1.0.exe"
 MAX_UPDATE_SIZE = 400 * 1024 * 1024

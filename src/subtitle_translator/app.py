@@ -3,6 +3,7 @@ import os
 import queue
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import threading
@@ -22,6 +23,9 @@ from pathlib import Path
 from tkinterdnd2 import DND_FILES, TkinterDnD
 from .ollama_client import list_models, translate
 from .audio_player import WavPlayer
+from .task_control import TaskControl, TaskCancelled
+from .sentence_preview import preview_sentence as speak_sentence
+from .voice_model import missing_model_files
 from .ui import build_ui
 from .updater import APP_VERSION, GITHUB_REPOSITORY, check_latest_release, download_release, launch_windows_installer
 
@@ -114,6 +118,8 @@ class SubtitleTranslator:
         self.active = "Ollama"
         self.events = queue.Queue()
         self.busy = False
+        self._close_after_stop = False
+        self._task_control = TaskControl()
         self.source_label = tk.StringVar(value="尚未载入 SRT")
         self.status = tk.StringVar(value="载入剪映导出的中文或中英双语 SRT；英文单语也可用于逐句查看。")
         if getattr(sys, "frozen", False):
@@ -136,8 +142,11 @@ class SubtitleTranslator:
         self.output_dir = tk.StringVar(value=self.settings.get("output_dir", str(project_dir / "输出")))
         self.github_repo = tk.StringVar(value=self.settings.get("github_repo", GITHUB_REPOSITORY))
         self.progress_value = tk.DoubleVar(value=0)
-        self.tts_python = tk.StringVar(value=str(project_dir / ".venv-tts" / "Scripts" / "python.exe"))
-        self.reference_audio = tk.StringVar()
+        voice_runtime = project_dir / ".venv-tts" / "Scripts" / "python.exe"
+        self.tts_python = tk.StringVar(value=str(voice_runtime))
+        self.reference_audio = tk.StringVar(value=self.settings.get("reference_audio", ""))
+        self.reference_audio.trace_add("write", self._persist_path_settings)
+        self.output_dir.trace_add("write", self._persist_path_settings)
         self.audio_player = WavPlayer()
         self.audio_name = tk.StringVar(value="生成配音后可在这里试听")
         self.audio_position = tk.DoubleVar(value=0)
@@ -148,6 +157,7 @@ class SubtitleTranslator:
         self.auto_voice_pending = False
         self.auto_voice_job = None
         self.auto_voice_started = 0.0
+        self.auto_voice_countdown = tk.StringVar(value="")
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(150, self._poll)
@@ -167,18 +177,32 @@ class SubtitleTranslator:
             "ollama_address": self.ollama_address.get().strip(),
             "ollama_model": self.model_name.get().strip(),
             "output_dir": self.output_dir.get().strip(),
+            "reference_audio": self.reference_audio.get().strip(),
             "github_repo": self.github_repo.get().strip(),
         }
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _persist_path_settings(self, *_args):
+        try:
+            self._save_settings()
+        except OSError as exc:
+            self.status.set(f"保存配音设置失败：{exc}")
+
     def _close(self):
         if self.busy:
-            messagebox.showinfo("正在处理", "请等当前翻译或配音完成后再关闭窗口，避免留下未配套的输出文件。")
+            if not messagebox.askyesno("任务执行中", "有执行中任务，是否强制停止并关闭？", parent=self.root):
+                return
+            self._close_after_stop = True
+            self.stop_task()
             return
         if hasattr(self, "_ui_confirm_edits") and not self._ui_confirm_edits():
             return
+        self._finish_close()
+
+    def _finish_close(self):
         self._cancel_auto_voice()
+        self._stop_sentence_preview()
         self.audio_player.close()
         try:
             self._save_settings()
@@ -211,6 +235,29 @@ class SubtitleTranslator:
 
     def _build(self):
         build_ui(self)
+        self.status.trace_add("write", self._update_stage_indicator)
+        self._update_stage_indicator()
+
+    def _update_stage_indicator(self, *_args):
+        """把长状态消息映射为稳定、易扫读的阶段标签。"""
+        if not hasattr(self, "stage_label"):
+            return
+        message = self.status.get()
+        if "停止" in message and ("正在" in message or "清理" in message):
+            stage, color = "停止中", "#A3322D"
+        elif "失败" in message or "无法" in message or "错误" in message:
+            stage, color = "需处理", "#A3322D"
+        elif "已输出" in message or "已载入" in message or "已保存" in message or "已完成" in message:
+            stage, color = "已完成", "#26734D"
+        elif "翻译" in message or "DeepL 正在" in message or "Ollama 正在" in message:
+            stage, color = "翻译中", "#16648F"
+        elif "配音" in message or "VoxCPM2" in message or "自动生成" in message:
+            stage, color = "配音中", "#16648F"
+        elif "试听" in message or "播放" in message:
+            stage, color = "试听中", "#16648F"
+        else:
+            stage, color = "就绪", "#16648F"
+        self.stage_label.configure(text=stage, fg=color)
 
     def load(self):
         path = filedialog.askopenfilename(title="选择字幕 SRT", filetypes=[("SRT 字幕", "*.srt"), ("所有文件", "*.*")])
@@ -281,8 +328,35 @@ class SubtitleTranslator:
         return None
 
     def show_deepl_help(self):
-        messagebox.showinfo("获取 DeepL API Key", "1. 注册或登录 DeepL API 计划。\n2. 打开“账户”→“API Keys & Limits”。\n3. 复制现有 Key，或点“Create key”新建。\n4. 粘贴到本软件的 API Key 输入框。\n\n接下来会打开 DeepL 官方帮助页。")
-        webbrowser.open(DEEPL_HELP_URL)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("获取 DeepL API Key")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text="1. 注册或登录 DeepL API 计划。\n"
+                 "2. 打开“账户”→“API Keys & Limits”。\n"
+                 "3. 复制现有 Key，或点“Create key”新建。\n"
+                 "4. 粘贴到本软件的 API Key 输入框。",
+            justify="left",
+        ).pack(anchor="w", pady=(0, 14))
+        actions = ttk.Frame(body)
+        actions.pack(fill="x")
+        ttk.Button(actions, text="取消", command=dialog.destroy).pack(side="left")
+
+        def open_deepl_page():
+            webbrowser.open(DEEPL_HELP_URL, new=2)
+            dialog.destroy()
+
+        ttk.Button(actions, text="打开浏览器获取 API Key", command=open_deepl_page).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.grab_set()
 
     def refresh_models(self, silent=False):
         if self.busy:
@@ -290,6 +364,59 @@ class SubtitleTranslator:
         address = self.ollama_address.get().strip()
         self.status.set("正在读取 Ollama 模型列表……")
         threading.Thread(target=self._models_worker, args=(address, silent), daemon=True).start()
+
+    def prompt_start_ollama(self, error):
+        """Offer to launch the installed Ollama app when its service is unavailable."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Ollama 未启用")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(bg="#F6F8F9")
+        tk.Label(dialog, text="当前无法连接 Ollama 服务。\n启用 Ollama 后再刷新模型列表？",
+                 bg="#F6F8F9", fg="#1E2C35", font=("Microsoft YaHei UI", 11),
+                 justify="left", padx=24, pady=20).pack(fill="x")
+        actions = tk.Frame(dialog, bg="#F6F8F9", padx=16, pady=12)
+        actions.pack(fill="x")
+        def launch():
+            dialog.destroy()
+            try:
+                self.launch_ollama()
+            except OSError as exc:
+                messagebox.showerror("无法启动 Ollama", str(exc))
+                return
+            self.status.set("已启动 Ollama，正在等待服务就绪并刷新模型……")
+            self.root.after(1800, self.refresh_models)
+        tk.Button(actions, text="启用 Ollama", command=launch).pack(side="left", padx=(0, 8))
+        tk.Button(actions, text="取消", command=dialog.destroy).pack(side="right")
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.grab_set()
+
+    @staticmethod
+    def launch_ollama():
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        user_local = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "AppData" / "Local"
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        for path in (local / "Programs" / "Ollama" / "ollama app.exe",
+                     user_local / "Programs" / "Ollama" / "ollama app.exe",
+                     local / "Programs" / "Ollama" / "Ollama.exe",
+                     user_local / "Programs" / "Ollama" / "Ollama.exe",
+                     program_files / "Ollama" / "ollama app.exe",
+                     program_files / "Ollama" / "Ollama.exe"):
+            if path.is_file():
+                os.startfile(str(path))
+                return
+        # Some installations only expose the CLI; in that case start its service.
+        found = shutil.which("ollama")
+        if found:
+            subprocess.Popen([found, "serve"], cwd=str(Path(found).parent),
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) |
+                             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        raise OSError("未找到 Ollama 桌面程序或命令行程序。请先安装 Ollama，或确认安装路径可用。")
 
     def _models_worker(self, address, silent):
         event_type = "MODELS_AUTO" if silent else "MODELS"
@@ -334,7 +461,6 @@ class SubtitleTranslator:
         folder = filedialog.askdirectory(title="选择输出文件夹", initialdir=self.output_dir.get())
         if folder:
             self.output_dir.set(folder)
-            self._save_settings()
 
     def open_output_folder(self, folder=None):
         raw_folder = str(folder) if folder is not None else self.output_dir.get().strip()
@@ -347,6 +473,14 @@ class SubtitleTranslator:
             os.startfile(str(folder))
         except OSError as exc:
             messagebox.showerror("无法打开输出目录", f"{folder}\n\n{exc}")
+
+    def open_preview_folder(self):
+        """打开当前试听 WAV 所在目录；没有载入 WAV 时回退到输出目录。"""
+        audio_path = self.audio_player.path
+        if audio_path is not None:
+            self.open_output_folder(Path(audio_path).parent)
+        else:
+            self.open_output_folder()
 
     def check_updates(self):
         if self.busy:
@@ -378,8 +512,9 @@ class SubtitleTranslator:
         self.status.set(f"正在下载版本 {release['tag']}……")
         threading.Thread(target=self._download_update_worker, args=(release,), daemon=True).start()
 
-    def show_completion_dialog(self, folder):
+    def show_completion_dialog(self, folder, wav_path, positions):
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
         dialog.title("生成完成")
         dialog.transient(self.root)
         dialog.resizable(False, False)
@@ -391,9 +526,55 @@ class SubtitleTranslator:
         actions.pack(fill="x")
         ttk.Button(actions, text="打开输出目录",
                    command=lambda: self.open_output_folder(folder)).pack(side="left")
+        def load_to_preview():
+            try:
+                self._load_audio(wav_path, positions=positions)
+                self._refresh_audio_player()
+            except Exception as exc:
+                messagebox.showerror("载入试听失败", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+
+        ttk.Button(actions, text="载入到试听",
+                   command=load_to_preview).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="关闭", command=dialog.destroy).pack(side="right")
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        width = dialog.winfo_reqwidth()
+        height = dialog.winfo_reqheight()
+        self.root.update_idletasks()
+        parent_x = self.root.winfo_rootx()
+        parent_y = self.root.winfo_rooty()
+        parent_width = self.root.winfo_width()
+        parent_height = self.root.winfo_height()
+        screen_width = dialog.winfo_screenwidth()
+        screen_height = dialog.winfo_screenheight()
+        if parent_width <= 1 or parent_height <= 1:
+            parent_x = parent_y = 0
+            parent_width, parent_height = screen_width, screen_height
+        x = max(0, min(parent_x + (parent_width - width) // 2, screen_width - width))
+        y = max(0, min(parent_y + (parent_height - height) // 2, screen_height - height))
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.deiconify()
+        # 等 Windows 标题栏和边框完成布局后再按实际窗口尺寸校准位置。
+        dialog.after_idle(lambda: self._recenter_completion_dialog(dialog))
         dialog.grab_set()
+
+    def _recenter_completion_dialog(self, dialog):
+        if not dialog.winfo_exists():
+            return
+        dialog.update_idletasks()
+        self.root.update_idletasks()
+        width, height = dialog.winfo_width(), dialog.winfo_height()
+        parent_x, parent_y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        parent_width, parent_height = self.root.winfo_width(), self.root.winfo_height()
+        screen_width, screen_height = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+        if parent_width <= 1 or parent_height <= 1:
+            parent_x = parent_y = 0
+            parent_width, parent_height = screen_width, screen_height
+        x = max(0, min(parent_x + (parent_width - width) // 2, screen_width - width))
+        y = max(0, min(parent_y + (parent_height - height) // 2, screen_height - height))
+        dialog.geometry(f"+{x}+{y}")
 
     def _set_progress(self, percent):
         self.progress_value.set(percent)
@@ -404,7 +585,86 @@ class SubtitleTranslator:
         seconds = max(0, int(milliseconds // 1000))
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
+    def _stop_sentence_preview(self):
+        control = getattr(self, "_sentence_control", None)
+        if control is not None:
+            control.cancel()
+        self._sentence_control = None
+        if getattr(self, "_segment_preview_end_ms", None) is not None:
+            try:
+                self.audio_player.pause()
+            except RuntimeError:
+                pass
+        self._segment_preview_end_ms = None
+        self._segment_preview_row = None
+        self._sentence_index = None
+        self._sentence_token = getattr(self, "_sentence_token", 0) + 1
+        self._clear_preview_highlight()
+        for button in getattr(self, "sentence_preview_buttons", []):
+            if button is not None:
+                button.configure(text="试听")
+
+    def _clear_preview_highlight(self):
+        if not hasattr(self, "table"):
+            return
+        for row in self.table.get_children():
+            tags = tuple(tag for tag in self.table.item(row, "tags") if tag != "playing")
+            self.table.item(row, tags=tags)
+        self._preview_last_row = None
+
+    def preview_sentence(self, index):
+        if index != 2 or self.busy or not self.items or not self.table.selection():
+            return
+        if self.audio_player.path is None:
+            messagebox.showinfo("需要试听音频", "请先打开或生成英文配音 WAV，再试听当前字幕对应的语音。", parent=self.root)
+            return
+        row = int(self.table.selection()[0])
+        if (getattr(self, "_sentence_index", None) == index
+                and getattr(self, "_segment_preview_row", None) == row):
+            self._stop_sentence_preview()
+            self.audio_play_label.set("播放")
+            self.status.set("当前字幕试听已停止。")
+            return
+        positions = getattr(self, "_preview_positions", [])
+        if row >= len(positions):
+            messagebox.showinfo("缺少字幕时间", "当前 WAV 没有对应的字幕时间，无法截取这一句试听。", parent=self.root)
+            return
+        self._stop_sentence_preview()
+        self._cancel_auto_voice()
+        timing = positions[row]
+        start_ms = int(timing["start_ms"])
+        end_ms = int(timing.get("end_ms", positions[row + 1]["start_ms"] if row + 1 < len(positions) else self.audio_duration_ms))
+        end_ms = min(end_ms, self.audio_duration_ms)
+        if end_ms <= start_ms:
+            messagebox.showinfo("字幕时间无效", "当前字幕的结束时间不晚于开始时间，无法试听。", parent=self.root)
+            return
+        set_selection = getattr(self, "_ui_set_selection", None)
+        if set_selection is not None:
+            set_selection(str(row))
+        self.table.focus(str(row))
+        self._clear_preview_highlight()
+        self.audio_player.seek(start_ms)
+        self.audio_player.play()
+        self._segment_preview_end_ms = end_ms
+        self._segment_preview_row = row
+        self._preview_follow_enabled = False
+        self._sentence_index = index
+        self.sentence_preview_buttons[index].configure(text="停止")
+        self.audio_play_label.set("暂停")
+        self.status.set(f"正在试听第 {row + 1} 条字幕对应的配音片段。")
+
+    def _sentence_worker(self, text, language, control, token):
+        error = None
+        try:
+            speak_sentence(text, language, control)
+        except Exception as exc:
+            if not control.cancelled.is_set():
+                error = str(exc)
+        self.events.put(("SENTENCE_PREVIEW", {"token": token}, error))
+
     def _load_audio(self, path, positions=None):
+        self._stop_sentence_preview()
+        self._clear_preview_highlight()
         name = self.audio_player.load(path)
         self.audio_duration_ms = self.audio_player.duration_ms
         self.audio_name.set(name)
@@ -418,14 +678,18 @@ class SubtitleTranslator:
             try:
                 blocks = read_srt(companion) if companion.is_file() else []
                 timings = blocks if len(blocks) == len(self.items) else self.items
-                positions = [{"start_ms": self._parse_preview_time(item["time"].split("-->")[0])}
-                             for item in timings]
+                positions = [{
+                    "start_ms": self._parse_preview_time(item["time"].split("-->")[0]),
+                    "end_ms": self._parse_preview_time(item["time"].split("-->")[1]),
+                } for item in timings]
             except (OSError, ValueError, KeyError):
                 positions = []
         self._preview_positions = positions
         self._preview_items = self.items
         self._preview_last_row = None
         self._preview_last_position = None
+        if hasattr(self, "_ui_refresh_edit_state"):
+            self._ui_refresh_edit_state()
 
     @staticmethod
     def _parse_preview_time(value):
@@ -433,6 +697,8 @@ class SubtitleTranslator:
         return round((int(hours) * 3600 + int(minutes) * 60 + float(seconds)) * 1000)
 
     def _follow_preview(self, position, mode):
+        if not getattr(self, "_preview_follow_enabled", True):
+            return
         positions = getattr(self, "_preview_positions", [])
         if not positions or getattr(self, "_preview_items", None) is not self.items:
             return
@@ -447,16 +713,18 @@ class SubtitleTranslator:
         row = str(index)
         if row == getattr(self, "_preview_last_row", None) or not self.table.exists(row):
             return
-        previous = getattr(self, "_preview_last_row", None)
-        if previous is not None and self.table.exists(previous):
-            tags = tuple(tag for tag in self.table.item(previous, "tags") if tag != "playing")
-            self.table.item(previous, tags=tags)
+        self._clear_preview_highlight()
         self.table.item(row, tags=("playing",) + tuple(tag for tag in self.table.item(row, "tags") if tag != "playing"))
         self.table.see(row)
         self._preview_last_row = row
         # 有未保存编辑时只移动播放标记，不切换编辑框或弹出保存提示。
         if not getattr(self, "_ui_has_unsaved_edits", lambda: False)():
-            self.table.selection_set(row)
+            set_selection = getattr(self, "_ui_set_selection", None)
+            if set_selection is not None:
+                set_selection(row)
+            else:
+                self.table.selection_remove(*self.table.selection())
+                self.table.selection_set(row)
             self.table.focus(row)
 
     def open_audio_preview(self):
@@ -473,6 +741,8 @@ class SubtitleTranslator:
                 messagebox.showerror("无法打开音频", str(exc))
 
     def toggle_audio_preview(self):
+        self._stop_sentence_preview()
+        self._preview_follow_enabled = True
         try:
             if self.audio_player.mode() == "playing":
                 self.audio_player.pause()
@@ -483,6 +753,7 @@ class SubtitleTranslator:
         self._refresh_audio_player()
 
     def stop_audio_preview(self):
+        self._stop_sentence_preview()
         try:
             self.audio_player.stop()
         except Exception as exc:
@@ -497,6 +768,7 @@ class SubtitleTranslator:
             self.audio_seeking = False
             return
         was_playing = self.audio_player.mode() == "playing"
+        self._preview_follow_enabled = True
         try:
             self.audio_player.seek(self.audio_position.get(), resume=was_playing)
         except Exception as exc:
@@ -512,20 +784,44 @@ class SubtitleTranslator:
         if self.audio_player.path is not None:
             mode = self.audio_player.mode()
             position = self.audio_player.position()
+            segment_end = getattr(self, "_segment_preview_end_ms", None)
+            if segment_end is not None and (mode != "playing" or position >= segment_end):
+                if mode == "playing":
+                    self.audio_player.pause()
+                self._segment_preview_end_ms = None
+                self._segment_preview_row = None
+                self._sentence_index = None
+                self.sentence_preview_buttons[2].configure(text="试听")
+                self._clear_preview_highlight()
+                mode = self.audio_player.mode()
             self.audio_play_label.set("暂停" if mode == "playing" else "播放")
             if not self.audio_seeking:
                 self.audio_position.set(position)
-                self._follow_preview(position, mode)
+                if getattr(self, "_sentence_index", None) is None:
+                    self._follow_preview(position, mode)
             self.audio_time_label.set(
                 f"{self._format_audio_time(position)} / "
                 f"{self._format_audio_time(self.audio_duration_ms)}"
             )
 
+    def stop_task(self):
+        if not self.busy or self._task_control.cancelled.is_set():
+            return
+        self._cancel_auto_voice()
+        self.stop_button.configure(state="disabled", text="正在停止…")
+        self.status.set("正在停止任务并清理临时文件……")
+        self._task_control.cancel()
+
     def _set_busy(self, busy):
+        if busy:
+            self._stop_sentence_preview()
+            self._task_control = TaskControl()
         self.busy = busy
+        self.stop_button.configure(state="normal" if busy else "disabled", text="停止")
         state = "disabled" if busy else "normal"
         self.translate_button.configure(state=state)
         self.generate_button.configure(state=state)
+        self.voice_model_button.configure(state=state)
         if hasattr(self, "_engine_buttons"):
             for button in self._engine_buttons.values():
                 button.configure(state=state)
@@ -565,17 +861,33 @@ class SubtitleTranslator:
         threading.Thread(target=self._translate_worker, args=(provider, api_key, model_name, address), daemon=True).start()
 
     def _translate_worker(self, provider, api_key, model_name, address):
+        control = self._task_control
         try:
-            def progress(done, total):
-                self.events.put(("TRANSLATE_PROGRESS", {"done": done, "total": total, "provider": provider}, None))
-            if provider == "DeepL":
-                values = translate_deepl(self.items, api_key, progress)
-            else:
-                values = translate(self.items, model_name, address, progress)
+            command = [sys.executable, "--translation-worker"] if getattr(sys, "frozen", False) else [
+                sys.executable, "-u", "-c",
+                "import sys; sys.path.insert(0, sys.argv[1]); from subtitle_translator.translation_worker import main; main()",
+                str(self.project_dir / "src"),
+            ]
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(self.project_dir / "src") + os.pathsep + environment.get("PYTHONPATH", "")
+            payload = json.dumps({"provider": provider, "api_key": api_key, "model": model_name,
+                                  "address": address, "items": self.items}, ensure_ascii=True)
+            values = None
+            for line in control.lines(command, payload=payload, env=environment):
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if "progress" in event:
+                    self.events.put(("TRANSLATE_PROGRESS", {"done": event["progress"], "total": event["total"], "provider": provider}, None))
+                if "error" in event:
+                    raise RuntimeError(event["error"])
+                if "result" in event:
+                    values = event["result"]
+            control.check()
+            if not isinstance(values, list) or len(values) != len(self.items):
+                raise ValueError("翻译进程没有返回完整结果。")
             self.events.put((provider, values, None))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")[:1000]
-            self.events.put((provider, None, f"HTTP {exc.code}: {body}"))
         except Exception as exc:
             self.events.put((provider, None, str(exc)))
 
@@ -583,6 +895,10 @@ class SubtitleTranslator:
         self._cancel_auto_voice()
         self.auto_voice_pending = True
         self.auto_voice_started = time.monotonic()
+        self.auto_voice_countdown.set(
+            f"剩余时间：{AUTO_VOICE_IDLE_SECONDS} 秒　｜　连续无操作后开始生成英文配音和双语字幕"
+        )
+        self.auto_voice_banner.grid()
         try:
             winsound.MessageBeep(winsound.MB_OK)
         except RuntimeError:
@@ -600,6 +916,14 @@ class SubtitleTranslator:
             except tk.TclError:
                 pass
             self.auto_voice_job = None
+        if hasattr(self, "auto_voice_banner"):
+            self.auto_voice_banner.grid_remove()
+
+    def cancel_auto_voice_countdown(self):
+        if not self.auto_voice_pending:
+            return
+        self._cancel_auto_voice()
+        self.status.set("已取消自动生成；需要时可手动点击“生成双语字幕与英文配音”。")
 
     def _check_auto_voice(self):
         self.auto_voice_job = None
@@ -613,16 +937,19 @@ class SubtitleTranslator:
         remaining = max(0, AUTO_VOICE_IDLE_SECONDS - elapsed,
                         AUTO_VOICE_IDLE_SECONDS - idle)
         if remaining <= 0:
-            self.auto_voice_pending = False
+            self._cancel_auto_voice()
             if not self.items or self.results[self.active] is None:
                 self.status.set("自动配音已取消：当前翻译方式没有可用译稿。")
                 return
-            self.status.set("电脑已空闲 30 秒，正在自动生成英文配音……")
+            self.status.set("倒计时结束，正在自动生成英文配音和中英双语字幕……")
             self.generate_bundle()
             return
+        seconds_left = max(1, int(remaining + 0.999))
+        self.auto_voice_countdown.set(
+            f"剩余时间：{seconds_left} 秒　｜　连续无操作后开始生成英文配音和双语字幕"
+        )
         self.status.set(
-            f"翻译已完成；电脑空闲 {min(idle, AUTO_VOICE_IDLE_SECONDS):.0f}/"
-            f"{AUTO_VOICE_IDLE_SECONDS} 秒后自动生成配音。"
+            f"字幕已生成；连续无操作倒计时 {seconds_left} 秒。可在醒目提示栏取消。"
         )
         self.auto_voice_job = self.root.after(1000, self._check_auto_voice)
 
@@ -630,6 +957,31 @@ class SubtitleTranslator:
         try:
             while True:
                 provider, values, error = self.events.get_nowait()
+                if provider == "SENTENCE_PREVIEW":
+                    if values["token"] == getattr(self, "_sentence_token", None):
+                        self._stop_sentence_preview()
+                        self.status.set("单句试听失败。" if error else "单句试听结束。")
+                        if error:
+                            messagebox.showerror("单句试听失败", error, parent=self.root)
+                    continue
+                if self._task_control.cancelled.is_set() and provider in ("DeepL", "Ollama", "TRANSLATE_PROGRESS", "TTS_PROGRESS", "TTS_MODEL_PROGRESS", "TTS_MODEL_READY", "TTS_MODEL_ERROR", "TTS_MODEL_CANCELLED", "TTS_COMPLETE", "TTS_ERROR"):
+                    if provider in ("TRANSLATE_PROGRESS", "TTS_PROGRESS", "TTS_MODEL_PROGRESS"):
+                        continue
+                    cleanup_error = None
+                    if provider == "TTS_COMPLETE":
+                        try:
+                            Path(values["staged_wav"]).unlink(missing_ok=True)
+                        except OSError as exc:
+                            cleanup_error = str(exc)
+                    if provider == "TTS_ERROR" and error and error.startswith("清理失败"):
+                        cleanup_error = error
+                    self._set_busy(False)
+                    self._set_progress(0)
+                    self.status.set("任务已停止，未完成任务的临时文件已清理。" if not cleanup_error else f"任务已停止，但部分临时文件无法删除：{cleanup_error}")
+                    if self._close_after_stop:
+                        self._finish_close()
+                        return
+                    continue
                 if provider == "UPDATE_CHECK":
                     self.update_button.configure(state="normal")
                     if not values["available"]:
@@ -669,7 +1021,10 @@ class SubtitleTranslator:
                     if error:
                         if provider == "MODELS":
                             self.status.set("读取 Ollama 模型失败。")
-                            messagebox.showerror("读取 Ollama 模型失败", error)
+                            if "urlopen error" in error.lower() or "connection refused" in error.lower():
+                                self.prompt_start_ollama(error)
+                            else:
+                                messagebox.showerror("读取 Ollama 模型失败", error)
                     else:
                         self.available_models = values
                         if values and self.model_name.get() not in values:
@@ -685,6 +1040,26 @@ class SubtitleTranslator:
                 if provider == "TTS_PROGRESS":
                     self._set_progress(100 * values["done"] / values["total"])
                     self.status.set(f"VoxCPM2 正在生成英文配音：{values['done']}/{values['total']} 组")
+                    continue
+                if provider == "TTS_MODEL_PROGRESS":
+                    total = values["total"]
+                    percent = 100 * values["done"] / total if total else 0
+                    self._set_progress(percent)
+                    self.status.set(
+                        f"正在下载 VoxCPM2 配音模型：{values['filename']} "
+                        f"{values['done'] / 1024**2:.1f}/{total / 1024**2:.1f} MB（{percent:.0f}%）"
+                    )
+                    continue
+                if provider == "TTS_MODEL_READY":
+                    self._set_progress(100)
+                    self._set_busy(False)
+                    self.status.set("VoxCPM2 配音模型下载完成。")
+                    messagebox.showinfo("配音模型", "VoxCPM2 配音模型已下载，可以开始生成英文配音。")
+                    continue
+                if provider == "TTS_MODEL_ERROR":
+                    self._set_busy(False)
+                    self.status.set("VoxCPM2 配音模型下载失败。")
+                    messagebox.showerror("配音模型下载失败", error)
                     continue
                 if provider == "TTS_COMPLETE":
                     stamp = values["timestamp"]
@@ -722,7 +1097,7 @@ class SubtitleTranslator:
                     self._set_progress(100)
                     self._set_busy(False)
                     self.status.set(f"已输出中英双语字幕和英文配音：{values['folder']}")
-                    self.show_completion_dialog(values["folder"])
+                    self.show_completion_dialog(values["folder"], wav_path, values["positions"])
                     continue
                 if provider == "TTS_ERROR":
                     self._set_busy(False)
@@ -815,15 +1190,24 @@ class SubtitleTranslator:
         entry.bind("<Return>", save)
         entry.bind("<FocusOut>", save)
 
-    def choose_tts_python(self):
-        path = filedialog.askopenfilename(title="选择 VoxCPM 虚拟环境的 python.exe", filetypes=[("Python", "python.exe")])
-        if path:
-            self.tts_python.set(path)
-
     def choose_reference(self):
         path = filedialog.askopenfilename(title="选择自己的声音参考片段", filetypes=[("WAV 音频", "*.wav"), ("所有文件", "*.*")])
         if path:
             self.reference_audio.set(path)
+
+    def open_reference_audio(self):
+        raw_path = self.reference_audio.get().strip()
+        if not raw_path:
+            messagebox.showinfo("尚未选择参考声音", "请先填写或浏览选择 WAV 音频文件。")
+            return
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            messagebox.showerror("参考声音不存在", f"找不到文件：\n{path}")
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            messagebox.showerror("无法打开参考声音", f"{path}\n\n{exc}")
 
     @staticmethod
     def _timecode(milliseconds):
@@ -884,6 +1268,59 @@ class SubtitleTranslator:
         target.mkdir(parents=True, exist_ok=True)
         self._write_srt(output_path or target / f"中英双语字幕-{version}.srt", bilingual_blocks)
 
+    def check_voice_model(self):
+        if self.busy:
+            return
+        python_path = Path(self.tts_python.get().strip())
+        if not python_path.is_file():
+            messagebox.showerror("尚未安装配音环境", "请先运行软件同目录的 setup_voxcpm.bat，安装完成后再检测配音模型。")
+            return
+        missing = missing_model_files(self.project_dir / ".model-cache")
+        if not missing:
+            self.status.set("VoxCPM2 配音模型已下载。")
+            messagebox.showinfo("配音模型检测", "VoxCPM2 配音模型已下载。")
+            return
+        if not messagebox.askyesno(
+            "配音模型检测",
+            "VoxCPM2 配音模型尚未下载完整。\n\n是否现在开始下载？",
+        ):
+            self.status.set("已取消配音模型下载。")
+            return
+        self._cancel_auto_voice()
+        self._set_progress(0)
+        self._set_busy(True)
+        self.status.set("正在下载 VoxCPM2 配音模型……")
+        threading.Thread(target=self._download_voice_model_worker, args=(python_path,), daemon=True).start()
+
+    def _download_voice_model_worker(self, python_path):
+        worker = (Path(sys._MEIPASS) / "tts_worker.py") if getattr(sys, "frozen", False) else Path(__file__).with_name("tts_worker.py")
+        command = [str(python_path), "-u", str(worker), "--download-model"]
+        environment = os.environ.copy()
+        environment["HF_HOME"] = str(self.project_dir / ".model-cache")
+        ready = False
+        recent = []
+        try:
+            for line in self._task_control.lines(command, env=environment):
+                recent.append(line.strip())
+                recent = recent[-12:]
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if "model_download" in event:
+                    self.events.put(("TTS_MODEL_PROGRESS", event["model_download"], None))
+                elif event.get("model_ready"):
+                    ready = True
+                elif "error" in event:
+                    raise RuntimeError(event["error"])
+            if not ready or missing_model_files(self.project_dir / ".model-cache"):
+                raise RuntimeError("配音模型仍不完整。" + "\n".join(recent))
+            self.events.put(("TTS_MODEL_READY", None, None))
+        except TaskCancelled:
+            self.events.put(("TTS_MODEL_CANCELLED", None, None))
+        except Exception as exc:
+            self.events.put(("TTS_MODEL_ERROR", None, str(exc)))
+
     def generate_bundle(self):
         if self.busy:
             return
@@ -898,7 +1335,7 @@ class SubtitleTranslator:
             return
         python_path = Path(self.tts_python.get().strip())
         if not python_path.is_file():
-            messagebox.showerror("缺少语音环境", "未找到 VoxCPM 专用 Python。请先运行 setup_voxcpm.bat，或选择正确的 python.exe。")
+            messagebox.showerror("尚未安装配音环境", "请先运行软件同目录的 setup_voxcpm.bat，安装完成后再生成英文配音。")
             return
         reference = self.reference_audio.get().strip()
         if reference and not Path(reference).is_file():
@@ -939,55 +1376,73 @@ class SubtitleTranslator:
         ).start()
 
     def _tts_worker(self, python_path, worker, folder, version, reference, items, timestamp):
+        control = self._task_control
         staged_wav = Path(folder) / f".英文配音-{version}-{uuid.uuid4().hex}.wav"
+        result = None
+        failure = None
+        temp_dir = None
         try:
-            with tempfile.TemporaryDirectory(prefix="subtitle_voice_") as temp_dir:
-                manifest = {
-                    "items": items,
-                    "reference_wav": reference,
-                    "wav_path": str(staged_wav),
-                    "timing_path": str(Path(temp_dir) / "timing.json"),
-                }
+            task_cache = self.project_dir / ".task-cache"
+            task_cache.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="subtitle_voice_", dir=task_cache) as temp_dir:
+                manifest = {"items": items, "reference_wav": reference,
+                            "wav_path": str(staged_wav), "task_temp_dir": temp_dir,
+                            "timing_path": str(Path(temp_dir) / "timing.json")}
                 manifest_path = Path(temp_dir) / "manifest.json"
                 manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-                flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 environment = os.environ.copy()
                 environment["HF_HOME"] = str(self.project_dir / ".model-cache")
-                process = subprocess.Popen(
-                    [python_path, "-u", worker, str(manifest_path)],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, encoding="utf-8", errors="replace", creationflags=flags,
-                    env=environment,
-                )
+                environment["TMP"] = environment["TEMP"] = temp_dir
                 recent = []
-                for line in process.stdout:
+                command = [python_path, "-u", str(worker), str(manifest_path)]
+                for line in control.lines(command, env=environment):
                     recent.append(line.strip())
                     recent = recent[-12:]
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError:
+                    except ValueError:
                         continue
+                    if "error" in event:
+                        failure = event["error"]
                     if "progress" in event:
                         self.events.put(("TTS_PROGRESS", {"done": event["progress"], "total": event["total"]}, None))
-                code = process.wait()
+                    if "model_download" in event:
+                        self.events.put(("TTS_MODEL_PROGRESS", event["model_download"], None))
+                control.check()
                 timing_path = Path(manifest["timing_path"])
-                if code != 0 or not timing_path.is_file():
-                    raise RuntimeError("\n".join(recent) or f"语音进程退出代码：{code}")
+                if not timing_path.is_file():
+                    raise RuntimeError(failure or "\n".join(recent) or "没有生成配音时间码。")
                 positions = json.loads(timing_path.read_text(encoding="utf-8"))["positions"]
                 if len(positions) != len(items):
                     raise ValueError("生成的字幕时间数量与原字幕不一致。")
                 if not staged_wav.is_file() or staged_wav.stat().st_size <= 44:
                     raise ValueError("语音文件未成功生成。")
-                self.events.put(("TTS_COMPLETE", {"folder": folder, "version": version,
-                                                  "positions": positions, "staged_wav": str(staged_wav),
-                                                  "timestamp": timestamp,
-                                                  "english": [x["english"] for x in items]}, None))
+                result = {"folder": folder, "version": version, "positions": positions,
+                          "staged_wav": str(staged_wav), "timestamp": timestamp,
+                          "english": [x["english"] for x in items]}
+            control.check()
         except Exception as exc:
-            try:
-                staged_wav.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self.events.put(("TTS_ERROR", None, str(exc)))
+            result = None
+            failure = failure or str(exc)
+        finally:
+            if temp_dir is not None and Path(temp_dir).exists():
+                result = None
+                failure = f"清理失败：任务临时目录仍被占用：{temp_dir}"
+            # 强制退出不会执行子进程 finally；由父进程删除本任务的残留。
+            targets = [staged_wav.with_suffix(".partial.wav")]
+            if result is None or control.cancelled.is_set():
+                targets.append(staged_wav)
+                result = None
+            for target in targets:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError as exc:
+                    result = None
+                    failure = f"清理失败：{target}：{exc}"
+        if result is not None:
+            self.events.put(("TTS_COMPLETE", result, None))
+        else:
+            self.events.put(("TTS_ERROR", None, failure))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 .venv/
 .venv-tts/
 .model-cache/
+.task-cache/
 model-check/
 __pycache__/
 *.py[cod]
